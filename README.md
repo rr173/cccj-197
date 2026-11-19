@@ -141,7 +141,7 @@ generated files are not committed.
 ## Tests
 
 ```bash
-python3 run_tests.py            # 125 tests
+python3 run_tests.py            # 169 tests
 python3 run_tests.py test_drill -v
 ```
 
@@ -151,6 +151,87 @@ the local IfcOpenShell to `sys.path`.
 The drill expectations were written by hand in
 [`docs/drill-expectations.md`](docs/drill-expectations.md) and are asserted by
 `tests/test_expectations.py`.
+
+## Cross-version comparison
+
+Given two already-built repositories for two periods of the same building, the
+`diff` entry point answers *which devices, properties and relationships
+changed* without opening either static handover package by hand.  Both input
+repositories are opened **read-only**; they are never merged, overwritten, or
+combined, and no geometry or design-compliance judgement is made.
+
+```bash
+python3 -m ifc_handover diff \
+    --left out/period-old.sqlite \
+    --right out/period-new.sqlite \
+    --dest out/change-dataset \
+    [--identity-map identity-map.json]
+
+python3 -m ifc_handover diff-report  --dataset out/change-dataset
+python3 -m ifc_handover diff-query   --dataset out/change-dataset \
+    --category semantic_change --aspect property
+python3 -m ifc_handover diff-query   --dataset out/change-dataset \
+    --global-id '<GlobalId>'
+python3 -m ifc_handover diff-export-jsonl --dataset out/change-dataset \
+    --jsonl out/changes.jsonl
+```
+
+### Identity
+
+* The automatic cross-version identity is the IfcRoot **GlobalId**.  Source
+  ids, file paths and STEP entity numbers are provenance, never identity;
+  objects without a GlobalId are listed separately as added/removed.
+* An optional explicit one-to-one correspondence table bridges objects whose
+  GlobalId really changed.  Duplicate rows, missing endpoints, reused endpoints
+  (many-to-one) and missing rationale reject the whole table before any output.
+  A mapping whose endpoint exists but is itself unusable (e.g. a duplicate
+  GlobalId) is reported as a locally incomparable pair with evidence, and the
+  mapping rationale is retained on the record.
+* No matching is ever guessed from name, type or spatial location.
+
+### Compared semantics and distinct outcomes
+
+The diff compares the semantics the repository already resolved: entity type,
+spatial parent/containment edges, type assignment, material structure and layer
+order, and effective property state/value/dimension/canonical unit.  Numeric
+values compare on their exact SI value, so **2 m and 2000 mm are unchanged**.
+The five property states — explicit null, missing, conflict, unsupported and
+unevaluated — stay distinct and are never folded into `""` or `0`.
+
+A property that moves from a type declaration to an instance declaration with
+the same effective state and value is **not** a value change: it is emitted as a
+separate `provenance_change` carrying the before/after declaration scope.
+Relationship targets compare through cross-version identity; room moves and
+material layer reorders are located to the specific edge or layer ordinal.
+
+The five result categories are kept separate: `added`, `removed`,
+`semantic_change`, `provenance_change` and `incomparable`.  A duplicate
+GlobalId, a conflicted/missing relation endpoint or an unusable mapped endpoint
+produces `incomparable` with source evidence — it is never disguised as a
+remove+add or a confident edit.
+
+### Dataset, determinism and safety
+
+The output is an independent directory (`changes.sqlite` + `changes.jsonl`)
+that re-opens read-only after being copied elsewhere, with no access to the
+input repositories.  Each record carries both sides' `source_id`/SHA-256, the
+matched identity, before/after value or state, relation/material locators,
+declaration provenance, and only the minimum `source_entities` STEP excerpts
+needed to trace each side — the two full repositories are never copied.
+
+* Records are content-hashed and emitted in a stable order; the same snapshots
+  and mapping reproduce identical business records.
+* Each input is fingerprinted when the comparison starts and re-verified before
+  publication.  A repository that changes during the run raises
+  `InputModifiedError` and no mixed-version dataset is emitted.
+* Writes go to a hidden staging directory and are atomically renamed on
+  success; a failed run leaves no directory that reads as a complete dataset.
+* The join streams sorted SQLite cursors with a bounded write buffer, so memory
+  stays flat as the object total grows (see `tests/test_diff_memory.py`).
+
+The two-period IFC fixtures and the hand-written expected change table are
+generated at test time in `tests/diff_fixtures.py`; no large generated files
+are committed.
 
 ## Design notes and limits
 

@@ -16,6 +16,7 @@ import os
 import sys
 from typing import Any
 
+from .diff import ChangeDataset, build_diff
 from .export import HandoverPackage, export_subset
 from .ingest import SourceIngestor, load_manifest
 from .store import Repository
@@ -167,6 +168,72 @@ def cmd_verify(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_diff(args: argparse.Namespace) -> int:
+    """Compare two read-only repositories into an independent change dataset."""
+
+    manifest = build_diff(
+        args.left,
+        args.right,
+        args.dest,
+        identity_mapping_path=args.identity_map,
+        label=args.label,
+    )
+    _print_json(
+        {
+            "dataset": args.dest,
+            "change_count": manifest.get("change_count"),
+            "category_counts": manifest.get("category_counts"),
+            "left_fingerprint": manifest["left"]["fingerprint"],
+            "right_fingerprint": manifest["right"]["fingerprint"],
+        }
+    )
+    return 0
+
+
+def cmd_diff_query(args: argparse.Namespace) -> int:
+    with ChangeDataset(args.dataset) as dataset:
+        rows = dataset.query(
+            category=args.category,
+            aspect=args.aspect,
+            global_id=args.global_id,
+            subject=args.subject,
+        )
+        if args.change_id:
+            row = dataset.get(args.change_id)
+            _print_json(row)
+            return 0 if row is not None else 2
+        _print_json(rows)
+    return 0
+
+
+def cmd_diff_report(args: argparse.Namespace) -> int:
+    with ChangeDataset(args.dataset) as dataset:
+        payload = {
+            "manifest": dataset.manifest(),
+            "summary": dataset.summary(),
+            "side_sources": dataset.side_sources(),
+            "identity_mappings": dataset.mappings(),
+            "object_summary": dataset.object_summary(),
+        }
+    _print_json(payload)
+    return 0
+
+
+def cmd_diff_export(args: argparse.Namespace) -> int:
+    with ChangeDataset(args.dataset) as dataset:
+        rows = dataset.query(
+            category=args.category,
+            aspect=args.aspect,
+            global_id=args.global_id,
+            subject=args.subject,
+        )
+        with open(args.jsonl, "w", encoding="utf-8", newline="\n") as fh:
+            for row in rows:
+                fh.write(json.dumps(row, sort_keys=True, ensure_ascii=False) + "\n")
+    _print_json({"jsonl": os.path.abspath(args.jsonl), "rows": len(rows)})
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ifc_handover",
@@ -229,6 +296,49 @@ def build_parser() -> argparse.ArgumentParser:
     verify = sub.add_parser("verify", help="verify an exported package")
     verify.add_argument("--package", required=True)
     verify.set_defaults(func=cmd_verify)
+
+    diff = sub.add_parser(
+        "diff",
+        help="compare two read-only repositories and write a change dataset",
+    )
+    diff.add_argument("--left", required=True, help="older repository SQLite file")
+    diff.add_argument("--right", required=True, help="newer repository SQLite file")
+    diff.add_argument("--dest", required=True, help="output change dataset directory")
+    diff.add_argument(
+        "--identity-map",
+        default=None,
+        help="optional explicit one-to-one GlobalId correspondence JSON",
+    )
+    diff.add_argument("--label", default=None)
+    diff.set_defaults(func=cmd_diff)
+
+    diff_query = sub.add_parser(
+        "diff-query", help="query change records from a change dataset"
+    )
+    diff_query.add_argument("--dataset", required=True)
+    diff_query.add_argument("--category", default=None)
+    diff_query.add_argument("--aspect", default=None)
+    diff_query.add_argument("--global-id", dest="global_id", default=None)
+    diff_query.add_argument("--subject", default=None)
+    diff_query.add_argument("--change-id", default=None)
+    diff_query.set_defaults(func=cmd_diff_query)
+
+    diff_report = sub.add_parser(
+        "diff-report", help="summarise a change dataset and its provenance"
+    )
+    diff_report.add_argument("--dataset", required=True)
+    diff_report.set_defaults(func=cmd_diff_report)
+
+    diff_export = sub.add_parser(
+        "diff-export-jsonl", help="export filtered change records as JSONL"
+    )
+    diff_export.add_argument("--dataset", required=True)
+    diff_export.add_argument("--jsonl", required=True)
+    diff_export.add_argument("--category", default=None)
+    diff_export.add_argument("--aspect", default=None)
+    diff_export.add_argument("--global-id", dest="global_id", default=None)
+    diff_export.add_argument("--subject", default=None)
+    diff_export.set_defaults(func=cmd_diff_export)
     return parser
 
 
