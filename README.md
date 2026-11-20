@@ -118,10 +118,11 @@ IfcOpenShell view are released before the next source starts; the durable store
 is SQLite, and spatial paths are walked from parent edges on demand rather than
 cached.
 
-Resolved properties and source excerpts are the two tables that grow with file
-size, so they are streamed into SQLite through a bounded buffer inside the
-source's write transaction instead of being accumulated in Python lists.
-Declaration equality uses a hashable key rather than per-property JSON.
+Resolved properties, resolved quantities and source excerpts are the tables
+that grow with file size, so they are streamed into SQLite through a bounded
+buffer inside the source's write transaction instead of being accumulated in
+Python lists.  Declaration equality uses a hashable key rather than
+per-declaration JSON.
 
 Measured on this machine (single source, generated corpus, `resources.getrusage`):
 
@@ -141,7 +142,7 @@ generated files are not committed.
 ## Tests
 
 ```bash
-python3 run_tests.py            # 207 tests
+python3 run_tests.py            # 275 tests
 python3 run_tests.py test_drill -v
 ```
 
@@ -293,6 +294,86 @@ The full format, the classification priority order and reproducible commands
 are documented in [`docs/release-verification.md`](docs/release-verification.md);
 the hand-written drill expectations are in
 [`docs/release-drill-expectations.md`](docs/release-drill-expectations.md).
+
+## Spatial quantity take-off
+
+Given one already-ingested, read-only object repository and a UTF-8 JSON
+rules file, the `takeoff` entry point answers the procurement question the
+per-object viewer cannot: for each spatial root and each equipment entity
+type, how many pieces are in scope and how much declared count, length, area,
+volume or weight do they carry, and which exact IFC quantity declarations
+produce each number.  It never computes geometry, never derives a quantity
+from dimensions, never rewrites the repository and never presents the result
+as a model-version diff or a handover signoff conclusion.
+
+```bash
+python3 -m ifc_handover takeoff-build \
+    --repository out/handover.sqlite \
+    --rules takeoff-rules.json --dest out/takeoff-dataset
+
+python3 -m ifc_handover takeoff-report  --dataset out/takeoff-dataset
+python3 -m ifc_handover takeoff-query   --dataset out/takeoff-dataset summaries
+python3 -m ifc_handover takeoff-query   --dataset out/takeoff-dataset details \
+    --rule rule-storey-a --type IfcPump --state valid
+python3 -m ifc_handover takeoff-object  --dataset out/takeoff-dataset \
+    --source-id mechanical --global-id '<GlobalId>'
+python3 -m ifc_handover takeoff-export-jsonl --dataset out/takeoff-dataset \
+    --jsonl out/takeoff.jsonl
+```
+
+* **Rules** name one or more `(source_id, GlobalId)` spatial roots, the IFC
+  entity types to include and, per rule, the quantity identities to take off.
+  A quantity identity is the triple `(quantity_set, name, declared_type)`;
+  the same name with a different declared type (e.g. an
+  `IfcQuantityLength` and an `IfcQuantityArea` both called `GaugeLength`) is
+  a different identity and is never merged.
+* **Scope** follows only the repository's valid spatial decomposition and
+  containment edges.  Type objects never count as equipment and material
+  relations never widen a scope.  An object reached over repeated edges is one
+  member per rule; the same object under two distinct roots is attributed
+  once under each.  Unresolvable roots, identity conflicts and broken edges
+  become scope anomalies carrying in-repository source coordinates; the scope
+  is marked unverified instead of silently shrunk.  Damage outside a root
+  never affects that root, and `empty_scope` is distinct from a complete
+  scope whose objects simply lack a declaration.
+* **Quantities** extend ingestion: `IfcElementQuantity` and
+  `IfcPhysicalSimpleQuantity` declarations are retained with their
+  type/instance owner, quantity set, definition provenance, STEP position,
+  original decimal spelling and unit source.  The five supported subtypes are
+  `IfcQuantityCount`, `IfcQuantityLength`, `IfcQuantityArea`,
+  `IfcQuantityVolume` and `IfcQuantityWeight`; any other subtype is retained
+  as an unsupported declaration with a reason, never dropped or guessed.
+* **Units**: an explicit quantity unit wins; otherwise the project unit for
+  the quantity's dimension is used.  Values normalise exactly to `count`,
+  `m`, `m²`, `m³` or `kg` with rational arithmetic — dimension mismatches,
+  offset units, unit reference cycles and non-finite numbers are distinct
+  failure states and never become zero.
+* **Precedence**: instance declarations override type declarations per
+  identity (an explicit zero is a real valid value); same-level equal
+  declarations merge with every source coordinate retained; same-level
+  differing declarations are a conflict with no value picked.  The type is
+  inherited only when no instance declaration exists.  Every required
+  identity on every included object is one of six explicit line states —
+  `valid`, `missing`, `conflict`, `unsupported`, `unit_unavailable`,
+  `scope_uncertain` — and missing/invalid lines never enter a total.
+* **Totals** are exact `Fraction` sums over valid lines only; each summary
+  also reports the included object count and the valid/missing/conflict/
+  unsupported/unit-unavailable/scope-uncertain counts, so every total is
+  independently recomputable from the detail lines.
+* The **dataset** (`takeoff.sqlite` + `takeoff.jsonl` + README) reopens
+  read-only after being copied elsewhere, with no access to the repository,
+  IFC files or old paths, and carries only the minimum STEP excerpts needed
+  to re-check a line.  The repository is fingerprinted at start and
+  re-verified before publication; a structural rule error or an input that
+  changes mid-run rejects the build and preserves the previous successful
+  dataset.  Scope walks and joins stream through SQLite with bounded buffers,
+  so memory stays flat as objects and declarations grow (see
+  `tests/test_takeoff_memory.py`).
+
+The format, identity and precedence rules and reproducible commands are
+documented in [`docs/takeoff-verification.md`](docs/takeoff-verification.md);
+the hand-written drill expectations are in
+[`docs/takeoff-drill-expectations.md`](docs/takeoff-drill-expectations.md).
 
 ## Design notes and limits
 

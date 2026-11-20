@@ -19,7 +19,12 @@ import sqlite3
 from contextlib import contextmanager
 from typing import Any, Iterator, Sequence
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+# Repository versions this build can open read-only.  A v1 repository was
+# written before physical quantities were ingested; it opens unchanged, and
+# the quantity tables are created on demand so the take-off layer reports an
+# empty quantity inventory rather than refusing a legacy deliverable.
+SUPPORTED_SCHEMA_VERSIONS = (1, 2)
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = OFF;
@@ -309,6 +314,98 @@ CREATE INDEX IF NOT EXISTS failures_category ON failure_evidence(category);
 CREATE INDEX IF NOT EXISTS failures_source ON failure_evidence(source_id);
 """
 
+# Physical quantity tables (schema v2).  Kept in a separate DDL string so the
+# same statements can be applied on demand to a v1 repository when it is
+# reopened by a newer build.
+QUANTITY_TABLES_SQL = """
+CREATE TABLE IF NOT EXISTS quantity_set_definitions (
+    qset_key TEXT PRIMARY KEY,
+    source_id TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    step_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    entity_type TEXT NOT NULL,
+    owner_scope TEXT NOT NULL,   -- instance | type | unassigned
+    method_of_measurement TEXT,
+    json TEXT
+);
+CREATE INDEX IF NOT EXISTS qsets_name ON quantity_set_definitions(name);
+CREATE INDEX IF NOT EXISTS qsets_source ON quantity_set_definitions(source_id);
+
+CREATE TABLE IF NOT EXISTS quantity_declarations (
+    qdecl_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    qdecl_key TEXT NOT NULL UNIQUE,
+    source_id TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    qset_key TEXT NOT NULL,
+    qset_name TEXT NOT NULL,
+    q_step_id INTEGER NOT NULL,
+    q_kind TEXT NOT NULL,
+    q_name TEXT,
+    identity TEXT NOT NULL,
+    signature TEXT NOT NULL,
+    state TEXT NOT NULL,          -- value | explicit_null | unsupported
+    dimension TEXT,
+    measure_type TEXT,
+    unit_step_id INTEGER,
+    unit_source TEXT,            -- explicit | NULL (project unit applied later)
+    original_raw TEXT,
+    formula TEXT,
+    json TEXT
+);
+CREATE INDEX IF NOT EXISTS qdecl_identity ON quantity_declarations(identity);
+CREATE INDEX IF NOT EXISTS qdecl_qset ON quantity_declarations(qset_key);
+CREATE INDEX IF NOT EXISTS qdecl_source ON quantity_declarations(source_id);
+CREATE INDEX IF NOT EXISTS qdecl_kind ON quantity_declarations(q_kind);
+
+CREATE TABLE IF NOT EXISTS object_quantity_sets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    object_key TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    qset_key TEXT,
+    qset_step_id INTEGER,
+    scope TEXT NOT NULL,         -- instance | type
+    relation_key TEXT,
+    state TEXT NOT NULL,
+    reason TEXT
+);
+CREATE INDEX IF NOT EXISTS object_qsets_object ON object_quantity_sets(object_key);
+CREATE INDEX IF NOT EXISTS object_qsets_qset ON object_quantity_sets(qset_key);
+
+-- Per-object effective quantity, resolved with the object's project units and
+-- instance-over-type precedence (mirrors resolved_properties for quantities).
+CREATE TABLE IF NOT EXISTS resolved_quantities (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    object_key TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    qset_name TEXT NOT NULL,
+    q_name TEXT,
+    q_kind TEXT NOT NULL,
+    identity TEXT NOT NULL,
+    state TEXT NOT NULL,         -- value | explicit_null | unsupported | conflict
+    value_status TEXT NOT NULL,  -- ok | missing | unsupported_type | missing_unit | ...
+    scope_used TEXT,             -- instance | type
+    dimension TEXT,
+    canonical_unit TEXT,
+    canonical_num TEXT,          -- exact Fraction numerator (text; never a float)
+    canonical_den TEXT,
+    canonical_decimal TEXT,
+    canonical_decimal_exact INTEGER,
+    original_raw TEXT,
+    unit_source TEXT,            -- explicit | project | none
+    is_conflict INTEGER NOT NULL DEFAULT 0,
+    reason TEXT,
+    json TEXT,
+    UNIQUE(object_key, identity)
+);
+CREATE INDEX IF NOT EXISTS rq_object ON resolved_quantities(object_key);
+CREATE INDEX IF NOT EXISTS rq_state ON resolved_quantities(state);
+CREATE INDEX IF NOT EXISTS rq_status ON resolved_quantities(value_status);
+CREATE INDEX IF NOT EXISTS rq_identity ON resolved_quantities(identity);
+"""
+
+SCHEMA_SQL = SCHEMA_SQL + QUANTITY_TABLES_SQL
+
 
 class AmbiguousIdentity(LookupError):
     """A business identity matched more than one entity.
@@ -345,6 +442,10 @@ class Repository:
                     "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
                     ("schema_version", str(SCHEMA_VERSION)),
                 )
+        else:
+            # Open an older deliverable read-only and add the quantity tables
+            # introduced in v2 without rewriting any existing business row.
+            self._ensure_quantity_tables()
         self._check_version()
 
     @classmethod
@@ -359,11 +460,29 @@ class Repository:
             ).fetchone()
         except sqlite3.DatabaseError as exc:
             raise ValueError(f"not an ifc_handover repository: {self.path}") from exc
-        if row is None or int(row["value"]) != SCHEMA_VERSION:
+        if row is None or int(row["value"]) not in SUPPORTED_SCHEMA_VERSIONS:
             raise ValueError(
                 f"repository schema version mismatch at {self.path}: "
-                f"{None if row is None else row['value']} != {SCHEMA_VERSION}"
+                f"{None if row is None else row['value']} not in {SUPPORTED_SCHEMA_VERSIONS}"
             )
+
+    def _ensure_quantity_tables(self) -> None:
+        """Create the v2 quantity tables on an older repository if absent.
+
+        Existing rows are never touched; the repository stays at its original
+        schema version marker and the new tables are simply empty for legacy
+        deliverables.
+        """
+
+        existing = {
+            r[0]
+            for r in self.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        if "quantity_declarations" in existing:
+            return
+        self.conn.executescript(QUANTITY_TABLES_SQL)
 
     # -- transactions ---------------------------------------------------
     @contextmanager
@@ -427,6 +546,10 @@ class Repository:
                 "DELETE FROM material_edges WHERE parent_key=?", [(k,) for k in material_keys]
             )
         for table in (
+            "resolved_quantities",
+            "object_quantity_sets",
+            "quantity_declarations",
+            "quantity_set_definitions",
             "resolved_properties",
             "object_psets",
             "material_assignments",
@@ -629,6 +752,60 @@ class Repository:
             data["detail"] = _load_json(data.pop("json"))
             out.append(data)
         return out
+
+    # -- quantity queries -----------------------------------------------
+    def resolved_quantities(self, object_key: str) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM resolved_quantities WHERE object_key=? "
+            "ORDER BY qset_name, q_name, q_kind",
+            (object_key,),
+        )
+        return [self._quantity_row(row) for row in rows]
+
+    def stream_resolved_quantities(
+        self, *, source_id: str | None = None
+    ) -> Iterator[sqlite3.Row]:
+        """Streaming cursor over resolved quantities, ordered for merge joins."""
+
+        sql = "SELECT * FROM resolved_quantities"
+        params: list[Any] = []
+        if source_id is not None:
+            sql += " WHERE source_id=?"
+            params.append(source_id)
+        sql += " ORDER BY object_key, identity"
+        return self.conn.execute(sql, params)
+
+    def _quantity_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        data = dict(row)
+        data["is_conflict"] = bool(data["is_conflict"])
+        data["canonical_decimal_exact"] = bool(data["canonical_decimal_exact"])
+        data["detail"] = _load_json(data.pop("json"))
+        return data
+
+    def quantity_declarations_for_qset(self, qset_key: str) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM quantity_declarations WHERE qset_key=? ORDER BY qdecl_id",
+            (qset_key,),
+        )
+        return [
+            {**dict(r), "detail": _load_json(r["json"])}
+            for r in rows
+        ]
+
+    def object_quantity_set_links(self, object_key: str | None = None) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM object_quantity_sets"
+        params: list[Any] = []
+        if object_key is not None:
+            sql += " WHERE object_key=?"
+            params.append(object_key)
+        sql += " ORDER BY id"
+        return [dict(r) for r in self.conn.execute(sql, params)]
+
+    def has_quantity_tables(self) -> bool:
+        rows = self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='resolved_quantities'"
+        ).fetchall()
+        return bool(rows)
 
     # -- relations ------------------------------------------------------
     def relations_for(self, object_key: str) -> list[dict[str, Any]]:
@@ -916,6 +1093,15 @@ class Repository:
             ),
             "resolved_properties": scalar(
                 "SELECT COUNT(*) FROM resolved_properties"
+            ),
+            "quantity_sets": scalar(
+                "SELECT COUNT(*) FROM quantity_set_definitions"
+            ),
+            "quantity_declarations": scalar(
+                "SELECT COUNT(*) FROM quantity_declarations"
+            ),
+            "resolved_quantities": scalar(
+                "SELECT COUNT(*) FROM resolved_quantities"
             ),
             "property_conflicts": scalar(
                 "SELECT COUNT(*) FROM resolved_properties WHERE is_conflict=1"

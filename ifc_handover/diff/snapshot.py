@@ -35,6 +35,10 @@ FINGERPRINT_TABLES: tuple[str, ...] = (
     "property_declarations",
     "object_psets",
     "resolved_properties",
+    "quantity_set_definitions",
+    "quantity_declarations",
+    "object_quantity_sets",
+    "resolved_quantities",
     "material_assignments",
     "material_nodes",
     "material_edges",
@@ -168,9 +172,14 @@ class RepoSnapShot:
             "source_entities",
             "failure_evidence",
             "property_declarations",
+            "object_quantity_sets",
+            "resolved_quantities",
         }:
             return True
-        if column == "decl_id" and table == "property_declarations":
+        if column in {"decl_id", "qdecl_id"} and table in {
+            "property_declarations",
+            "quantity_declarations",
+        }:
             return True
         return False
 

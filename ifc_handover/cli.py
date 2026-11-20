@@ -21,6 +21,7 @@ from .export import HandoverPackage, export_subset
 from .ingest import SourceIngestor, load_manifest
 from .release import ReleaseDataset, build_release_verification
 from .store import Repository
+from .takeoff import TakeoffDataset, build_takeoff
 
 
 def _print_json(value: Any) -> None:
@@ -327,6 +328,100 @@ def cmd_release_export(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_takeoff_build(args: argparse.Namespace) -> int:
+    manifest = build_takeoff(
+        args.repository, args.rules, args.dest, label=args.label
+    )
+    _print_json(
+        {
+            "dataset": os.path.abspath(args.dest),
+            "run": manifest.get("run"),
+            "repository_fingerprint": manifest["repository"]["fingerprint"],
+            "rules_sha256": manifest["rules"]["sha256"],
+        }
+    )
+    return 0
+
+
+def cmd_takeoff_report(args: argparse.Namespace) -> int:
+    with TakeoffDataset(args.dataset) as dataset:
+        payload = {
+            "manifest": dataset.manifest(),
+            "summary": dataset.summary(),
+            "rules": dataset.rules(),
+            "root_scopes": dataset.root_scopes(),
+            "sources": dataset.sources(),
+        }
+    _print_json(payload)
+    return 0
+
+
+def cmd_takeoff_query(args: argparse.Namespace) -> int:
+    with TakeoffDataset(args.dataset) as dataset:
+        if args.what == "details":
+            _print_json(
+                dataset.details(
+                    rule_id=args.rule,
+                    root_global_id=args.root_global_id,
+                    entity_type=args.type,
+                    identity=args.identity,
+                    line_state=args.state,
+                    global_id=args.global_id,
+                )
+            )
+        elif args.what == "summaries":
+            _print_json(
+                dataset.summaries(
+                    rule_id=args.rule,
+                    entity_type=args.type,
+                    identity=args.identity,
+                )
+            )
+        elif args.what == "anomalies":
+            _print_json(dataset.anomalies(rule_id=args.rule))
+        elif args.what == "scopes":
+            _print_json(dataset.root_scopes())
+        elif args.what == "evidence":
+            _print_json(
+                dataset.evidence(owner_kind=args.owner_kind, owner_id=args.owner_id)
+            )
+        else:  # pragma: no cover - argparse constrains this
+            raise SystemExit(f"unknown take-off query {args.what}")
+    return 0
+
+
+def cmd_takeoff_object(args: argparse.Namespace) -> int:
+    with TakeoffDataset(args.dataset) as dataset:
+        if args.object_key:
+            rows = dataset.object_detail_by_key(args.object_key)
+        else:
+            rows = dataset.object_detail_by_identity(args.source_id, args.global_id)
+        if not rows:
+            print("no take-off detail for the requested object", file=sys.stderr)
+            return 2
+        _print_json(rows)
+    return 0
+
+
+def cmd_takeoff_export(args: argparse.Namespace) -> int:
+    with TakeoffDataset(args.dataset) as dataset:
+        rows = 0
+        with open(args.jsonl, "w", encoding="utf-8", newline="\n") as fh:
+            for line in dataset.iter_jsonl():
+                if args.rule and line.get("rule_id") != args.rule:
+                    continue
+                if args.type and line.get("entity_type") != args.type:
+                    continue
+                if args.identity and line.get("identity") != args.identity:
+                    continue
+                if args.state and line.get("line_state") != args.state:
+                    continue
+                fh.write(json.dumps(line, sort_keys=True, ensure_ascii=False) + "\n")
+                rows += 1
+    _print_json({"jsonl": os.path.abspath(args.jsonl), "rows": rows})
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ifc_handover",
@@ -488,6 +583,59 @@ def build_parser() -> argparse.ArgumentParser:
     release_export.add_argument("--checkpoint", default=None)
     release_export.add_argument("--zone", default=None)
     release_export.set_defaults(func=cmd_release_export)
+
+    takeoff = sub.add_parser(
+        "takeoff-build",
+        help="build a spatial quantity take-off dataset from a read-only repository",
+    )
+    takeoff.add_argument("--repository", required=True, help="ingested object repository SQLite")
+    takeoff.add_argument("--rules", required=True, help="UTF-8 take-off rules JSON")
+    takeoff.add_argument("--dest", required=True, help="output take-off dataset directory")
+    takeoff.add_argument("--label", default=None)
+    takeoff.set_defaults(func=cmd_takeoff_build)
+
+    takeoff_report = sub.add_parser(
+        "takeoff-report", help="summarise a take-off dataset and its provenance"
+    )
+    takeoff_report.add_argument("--dataset", required=True)
+    takeoff_report.set_defaults(func=cmd_takeoff_report)
+
+    takeoff_query = sub.add_parser(
+        "takeoff-query", help="query details, summaries and scope anomalies"
+    )
+    takeoff_query.add_argument("--dataset", required=True)
+    takeoff_query.add_argument(
+        "what", choices=["details", "summaries", "anomalies", "scopes", "evidence"]
+    )
+    takeoff_query.add_argument("--rule", default=None)
+    takeoff_query.add_argument("--root-global-id", dest="root_global_id", default=None)
+    takeoff_query.add_argument("--type", default=None)
+    takeoff_query.add_argument("--identity", default=None)
+    takeoff_query.add_argument("--state", default=None)
+    takeoff_query.add_argument("--global-id", dest="global_id", default=None)
+    takeoff_query.add_argument("--owner-kind", dest="owner_kind", default=None)
+    takeoff_query.add_argument("--owner-id", dest="owner_id", default=None)
+    takeoff_query.set_defaults(func=cmd_takeoff_query)
+
+    takeoff_object = sub.add_parser(
+        "takeoff-object", help="query one object's full quantity detail"
+    )
+    takeoff_object.add_argument("--dataset", required=True)
+    takeoff_object.add_argument("--object-key", dest="object_key", default=None)
+    takeoff_object.add_argument("--source-id", dest="source_id", default=None)
+    takeoff_object.add_argument("--global-id", dest="global_id", default=None)
+    takeoff_object.set_defaults(func=cmd_takeoff_object)
+
+    takeoff_export = sub.add_parser(
+        "takeoff-export-jsonl", help="export filtered take-off records as JSONL"
+    )
+    takeoff_export.add_argument("--dataset", required=True)
+    takeoff_export.add_argument("--jsonl", required=True)
+    takeoff_export.add_argument("--rule", default=None)
+    takeoff_export.add_argument("--type", default=None)
+    takeoff_export.add_argument("--identity", default=None)
+    takeoff_export.add_argument("--state", default=None)
+    takeoff_export.set_defaults(func=cmd_takeoff_export)
     return parser
 
 

@@ -83,6 +83,10 @@ _MEASURE_DIMENSION: dict[str, str] = {
     "IFCAREAMEASURE": "AREA",
     "IFCVOLUMEMEASURE": "VOLUME",
     "IFCMASSMEASURE": "MASS",
+    # IfcQuantityWeight carries an IfcWeightMeasure; it is the same physical
+    # dimension as mass and normalises to kilograms.  It is only produced by
+    # the quantity layer, never by a plain property interpretation change.
+    "IFCWEIGHTMEASURE": "MASS",
 }
 
 # Known measure/type names that are valid IfcValue members but are outside the

@@ -169,6 +169,7 @@ class SourceContext:
     file: Any
     resolver: UnitResolver
     reader: PropertyReader
+    quantity_reader: "Any"
     store_path: str | None
     failures: list[dict[str, Any]] = field(default_factory=list)
     key_by_step: dict[int, str] = field(default_factory=dict)
@@ -179,6 +180,12 @@ class SourceContext:
     declarations: list[dict[str, Any]] = field(default_factory=list)
     declarations_by_pset: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     object_pset_links: list[dict[str, Any]] = field(default_factory=list)
+    # Physical quantities (IfcElementQuantity / IfcPhysicalSimpleQuantity).
+    qsets: list[dict[str, Any]] = field(default_factory=list)
+    quantity_declarations: list[dict[str, Any]] = field(default_factory=list)
+    qdeclarations_by_qset: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    object_qset_links: list[dict[str, Any]] = field(default_factory=list)
+    resolved_quantities: list[dict[str, Any]] = field(default_factory=list)
     type_links: dict[str, str] = field(default_factory=dict)
     project_units: dict[int, dict[str, dict[str, Any]]] = field(default_factory=dict)
     project_of_object: dict[str, int] = field(default_factory=dict)
@@ -193,6 +200,8 @@ class SourceContext:
     stream_table: str = "resolved_properties_stage"
     stream_buffer: list[dict[str, Any]] = field(default_factory=list)
     stream_count: int = 0
+    quantity_stream_buffer: list[tuple[Any, ...]] = field(default_factory=list)
+    quantity_stream_count: int = 0
     source_entity_buffer: list[tuple[Any, ...]] = field(default_factory=list)
     source_entity_count: int = 0
     gid_groups: dict[str, list[int]] = field(default_factory=lambda: defaultdict(list))
@@ -263,6 +272,30 @@ class SourceContext:
         self.stream_count += len(rows)
         self.stream_buffer.clear()
 
+    def stage_resolved_quantity(self, row: tuple[Any, ...]) -> None:
+        """Append one resolved quantity row to the bounded staging buffer."""
+
+        self.quantity_stream_buffer.append(row)
+        if len(self.quantity_stream_buffer) >= 200:
+            self.flush_resolved_quantities()
+
+    def flush_resolved_quantities(self) -> None:
+        if not self.quantity_stream_buffer:
+            return
+        if self.stream_conn is None:
+            raise IngestionError("resolved-quantity staging is not initialised")
+        self.stream_conn.executemany(
+            "INSERT INTO resolved_quantities_stage("
+            "object_key, source_id, qset_name, q_name, q_kind, identity, state, "
+            "value_status, scope_used, dimension, canonical_unit, canonical_num, "
+            "canonical_den, canonical_decimal, canonical_decimal_exact, original_raw, "
+            "unit_source, is_conflict, reason, json) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            self.quantity_stream_buffer,
+        )
+        self.quantity_stream_count += len(self.quantity_stream_buffer)
+        self.quantity_stream_buffer.clear()
+
     def stage_source_entity(self, row: tuple[Any, ...]) -> None:
         self.source_entity_buffer.append(row)
         if len(self.source_entity_buffer) >= 1000:
@@ -292,6 +325,9 @@ class SourceContext:
 
     def pset_key(self, step_id: int) -> str:
         return f"pset:{self.sha}:{step_id}"
+
+    def qset_key(self, step_id: int) -> str:
+        return f"qset:{self.sha}:{step_id}"
 
     def material_key(self, step_id: int) -> str:
         return f"mat:{self.sha}:{step_id}"
@@ -335,6 +371,9 @@ class SourceIngestor:
                 ) from exc
             resolver = UnitResolver(step)
             reader = PropertyReader(step, file.schema, resolver)
+            from .quantities import QuantityReader
+
+            quantity_reader = QuantityReader(step, file.schema)
             store_path = self._store_source()
             self.ctx = SourceContext(
                 repo=self.repo,
@@ -345,6 +384,7 @@ class SourceIngestor:
                 file=file,
                 resolver=resolver,
                 reader=reader,
+                quantity_reader=quantity_reader,
                 store_path=store_path,
             )
             # A dedicated connection owns the long-lived write transaction for
@@ -361,6 +401,15 @@ class SourceIngestor:
                 "prop_kind TEXT, identity TEXT, state TEXT, value_status TEXT, "
                 "scope_used TEXT, is_conflict INTEGER, reason TEXT, json TEXT)"
             )
+            conn.execute(
+                "CREATE TEMP TABLE resolved_quantities_stage("
+                "object_key TEXT, source_id TEXT, qset_name TEXT, q_name TEXT, "
+                "q_kind TEXT, identity TEXT, state TEXT, value_status TEXT, "
+                "scope_used TEXT, dimension TEXT, canonical_unit TEXT, "
+                "canonical_num TEXT, canonical_den TEXT, canonical_decimal TEXT, "
+                "canonical_decimal_exact INTEGER, original_raw TEXT, unit_source TEXT, "
+                "is_conflict INTEGER, reason TEXT, json TEXT)"
+            )
             self.ctx.stream_conn = conn
             self._collect_roots()
             self._collect_nodes()
@@ -368,11 +417,14 @@ class SourceIngestor:
             self._collect_relations()
             self._collect_psets()
             self._resolve_properties()
+            self._collect_quantity_sets()
+            self._resolve_quantities()
             self._collect_materials()
             self._inherit_type_materials()
             self._collect_external_references()
             self._collect_cycles()
             self.ctx.flush_resolved()
+            self.ctx.flush_resolved_quantities()
             self.ctx.flush_source_entities()
             self._write(started)
             return IngestResult(
@@ -396,6 +448,7 @@ class SourceIngestor:
                 self.ctx.step = None
                 self.ctx.stream_conn = None
                 self.ctx.stream_buffer.clear()
+                self.ctx.quantity_stream_buffer.clear()
                 self.ctx.source_entity_buffer.clear()
             self.ctx = None
 
@@ -730,7 +783,11 @@ class SourceIngestor:
             elif entity_type == "IfcRelDefinesByType":
                 self._collect_type_relation(entity)
             elif entity_type == "IfcRelDefinesByProperties":
-                self._collect_property_relation(entity)
+                definition = getattr(entity, "RelatingPropertyDefinition", None)
+                if definition is not None and definition.is_a("IfcElementQuantity"):
+                    self._collect_quantity_relation(entity)
+                else:
+                    self._collect_property_relation(entity)
             # Material, document and other associations are collected with
             # their payloads so hierarchy/order and external targets survive.
 
@@ -1045,6 +1102,502 @@ class SourceIngestor:
                     "resolved_related_step_ids": sorted(resolved),
                 },
             }
+        )
+
+    # -- quantity sets (IfcElementQuantity) --------------------------------
+    def _collect_quantity_relation(self, entity: Any) -> None:
+        """IfcRelDefinesByProperties whose definition is an IfcElementQuantity.
+
+        Mirrors :meth:`_collect_property_relation` but writes object quantity
+        set links with scope ``instance``; the quantity relation never widens
+        spatial scope and never pulls a type object in as a device.
+        """
+
+        ctx = self.ctx
+        assert ctx is not None
+        step_id = entity.id()
+        relation_key = ctx.relation_key(step_id)
+        ctx.archive(step_id, "relation")
+        definition = getattr(entity, "RelatingPropertyDefinition", None)
+        qset_step = definition.id() if definition is not None else None
+        raw = ctx.step.args(step_id)
+        raw_related = raw[4] if len(raw) > 4 else None
+        raw_related_ids = (
+            [r.step_id for r in raw_related.items if isinstance(r, Ref)]
+            if isinstance(raw_related, ListValue)
+            else []
+        )
+        resolved = {o.id() for o in (entity.RelatedObjects or ())}
+        if qset_step is None:
+            ctx.fail(
+                "missing_endpoint",
+                "error",
+                {
+                    "relation_key": relation_key,
+                    "relation_type": "IfcRelDefinesByProperties",
+                    "endpoint": "relating_element_quantity",
+                },
+                step_id=step_id,
+                relation_key=relation_key,
+            )
+        for object_id in raw_related_ids:
+            object_key = ctx.key_by_step.get(object_id)
+            edge_state = "ok"
+            if object_key is None or object_id not in resolved:
+                edge_state = "missing"
+                ctx.fail(
+                    "missing_endpoint",
+                    "error",
+                    {
+                        "relation_key": relation_key,
+                        "relation_type": "IfcRelDefinesByProperties",
+                        "endpoint": "related_quantity",
+                        "step_id": object_id,
+                    },
+                    step_id=step_id,
+                    relation_key=relation_key,
+                )
+            if object_key and qset_step is not None:
+                ctx.object_qset_links.append(
+                    {
+                        "object_key": object_key,
+                        "qset_key": ctx.qset_key(qset_step),
+                        "qset_step_id": qset_step,
+                        "scope": "instance",
+                        "relation_key": relation_key,
+                        "state": "ok" if edge_state == "ok" else "missing",
+                        "reason": None if edge_state == "ok" else "quantity set reference dropped",
+                    }
+                )
+        ctx.relations.append(
+            {
+                "relation_key": relation_key,
+                "source_id": self.source_id,
+                "sha256": ctx.sha,
+                "step_id": step_id,
+                "relation_type": "IfcRelDefinesByProperties",
+                "relating_key": ctx.qset_key(qset_step) if qset_step else None,
+                "relating_step_id": qset_step,
+                "state": "ok" if qset_step is not None and all(
+                    ctx.key_by_step.get(oid) is not None and oid in resolved
+                    for oid in raw_related_ids
+                ) else "missing",
+                "error": None,
+                "kind": "quantity",
+                "edges": [
+                    {
+                        "kind": "quantity",
+                        "ordinal": ordinal,
+                        "parent_key": ctx.qset_key(qset_step) if qset_step else None,
+                        "parent_step_id": qset_step,
+                        "child_key": ctx.key_by_step.get(oid),
+                        "child_step_id": oid,
+                        "edge_state": (
+                            "ok"
+                            if ctx.key_by_step.get(oid) is not None and oid in resolved
+                            else "missing"
+                        ),
+                        "reason": None
+                        if ctx.key_by_step.get(oid) is not None and oid in resolved
+                        else "quantity set assignment endpoint is not resolvable",
+                    }
+                    for ordinal, oid in enumerate(raw_related_ids)
+                ],
+                "raw": {
+                    "relating_step_id": qset_step,
+                    "related_step_ids": raw_related_ids,
+                    "resolved_related_step_ids": sorted(resolved),
+                },
+            }
+        )
+
+    def _collect_quantity_sets(self) -> None:
+        """Index every IfcElementQuantity and parse its physical quantities.
+
+        Type-owned quantity sets (an IfcTypeObject's HasPropertySets) are
+        linked with scope ``type``; instance assignments were recorded by
+        :meth:`_collect_quantity_relation`.  Unsupported quantity subtypes are
+        parsed and retained with their reason rather than dropped.
+        """
+
+        ctx = self.ctx
+        assert ctx is not None
+        from .quantities import quantity_identity, quantity_signature_key
+
+        # Type-level quantity sets live on IfcTypeObject.HasPropertySets.
+        for type_entity in ctx.file.by_type("IfcTypeObject"):
+            type_step = type_entity.id()
+            type_key = ctx.key_by_step.get(type_step)
+            if not type_key:
+                continue
+            for qset_entity in getattr(type_entity, "HasPropertySets", None) or ():
+                if not qset_entity.is_a("IfcElementQuantity"):
+                    continue
+                qset_step = qset_entity.id()
+                ctx.object_qset_links.append(
+                    {
+                        "object_key": type_key,
+                        "qset_key": ctx.qset_key(qset_step),
+                        "qset_step_id": qset_step,
+                        "scope": "type",
+                        "relation_key": None,
+                        "state": "ok",
+                        "reason": None,
+                    }
+                )
+
+        links_by_qset: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for link in ctx.object_qset_links:
+            links_by_qset[link["qset_key"]].append(link)
+
+        for entity in ctx.file.by_type("IfcElementQuantity", include_subtypes=True):
+            qset_step = entity.id()
+            if qset_step not in ctx.step.entities:
+                continue
+            ctx.archive(qset_step, "quantity_set")
+            name = _text(getattr(entity, "Name", None)) or ""
+            method = _text(getattr(entity, "MethodOfMeasurement", None))
+            qset_key = ctx.qset_key(qset_step)
+            links = links_by_qset.get(qset_key, [])
+            scopes = {l["scope"] for l in links if l["state"] == "ok"}
+            owner_scope = (
+                "instance"
+                if "instance" in scopes
+                else ("type" if "type" in scopes else "unassigned")
+            )
+            ctx.qsets.append(
+                {
+                    "qset_key": qset_key,
+                    "source_id": self.source_id,
+                    "sha256": ctx.sha,
+                    "step_id": qset_step,
+                    "name": name,
+                    "entity_type": entity.is_a(),
+                    "owner_scope": owner_scope,
+                    "method_of_measurement": method,
+                    "description": _text(getattr(entity, "Description", None)),
+                    "owner_keys": sorted(
+                        {l["object_key"] for l in links if l["state"] == "ok"}
+                    ),
+                }
+            )
+            raw = ctx.step.args(qset_step)
+            # IfcElementQuantity(GlobalId, OwnerHistory, Name, Description,
+            #                    MethodOfMeasurement, Quantities)
+            raw_quantities = raw[5] if len(raw) > 5 else None
+            raw_q_ids = (
+                [r.step_id for r in raw_quantities.items if isinstance(r, Ref)]
+                if isinstance(raw_quantities, ListValue)
+                else []
+            )
+            resolved_ids = {q.id() for q in (getattr(entity, "Quantities", None) or ())}
+            seen: set[int] = set()
+            for ordinal, q_step in enumerate(raw_q_ids):
+                if q_step in seen:
+                    ctx.fail(
+                        "duplicate_quantity_in_set",
+                        "warning",
+                        {
+                            "qset_key": qset_key,
+                            "qset_name": name,
+                            "q_step_id": q_step,
+                            "ordinal": ordinal,
+                        },
+                        step_id=q_step,
+                    )
+                    continue
+                seen.add(q_step)
+                step_entity = ctx.step.entities.get(q_step)
+                if step_entity is None or q_step not in resolved_ids:
+                    ctx.fail(
+                        "missing_quantity",
+                        "error",
+                        {"qset_key": qset_key, "qset_name": name, "q_step_id": q_step},
+                        step_id=q_step,
+                    )
+                    continue
+                ctx.archive(q_step, "quantity")
+                raw_quantity = ctx.quantity_reader.read(q_step, step_entity.type_name)
+                if raw_quantity.extra.get("attribute_count_mismatch"):
+                    ctx.fail(
+                        "attribute_count_mismatch",
+                        "error",
+                        {
+                            "step_id": q_step,
+                            "entity_type": step_entity.type_name,
+                            **raw_quantity.extra["attribute_count_mismatch"],
+                        },
+                        step_id=q_step,
+                    )
+                entry = {
+                    "qset_key": qset_key,
+                    "qset_name": name,
+                    "ordinal": ordinal,
+                    "raw": raw_quantity,
+                    "signature": quantity_signature_key(raw_quantity, ctx.resolver),
+                }
+                ctx.quantity_declarations.append(entry)
+                ctx.qdeclarations_by_qset.setdefault(qset_key, []).append(entry)
+
+    def _resolve_quantities(self) -> None:
+        """Resolve instance-over-type effective quantities per object.
+
+        The instance declarations of an identity completely replace the type
+        declarations of that identity; inheritance from the type happens only
+        when the instance has no declaration of the identity.  At one level,
+        equal declarations (same interpreted value and unit) merge while every
+        source coordinate is retained; differing declarations are a conflict
+        and none of them is picked.  An explicit zero is a normal value.
+        """
+
+        ctx = self.ctx
+        assert ctx is not None
+        from .quantities import interpret_quantity, quantity_identity
+
+        instance_by_object: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for link in ctx.object_qset_links:
+            if link["state"] == "ok" and link["scope"] == "instance":
+                instance_by_object[link["object_key"]].extend(
+                    ctx.qdeclarations_by_qset.get(link["qset_key"], [])
+                )
+        type_cache: dict[str, list[dict[str, Any]]] = {}
+
+        def type_quantity_declarations(type_key: str) -> list[dict[str, Any]]:
+            if type_key not in type_cache:
+                acc: list[dict[str, Any]] = []
+                for link in ctx.object_qset_links:
+                    if (
+                        link["object_key"] == type_key
+                        and link["scope"] == "type"
+                        and link["state"] == "ok"
+                    ):
+                        acc.extend(ctx.qdeclarations_by_qset.get(link["qset_key"], []))
+                type_cache[type_key] = acc
+            return type_cache[type_key]
+
+        for object_key, row in ctx.root_rows.items():
+            if not row.get("is_object"):
+                continue
+            type_key = ctx.type_links.get(object_key)
+            type_decls = (
+                type_quantity_declarations(type_key) if type_key else []
+            )
+            instance_decls = instance_by_object.get(object_key, [])
+            self._resolve_quantities_for_object(
+                object_key, instance_decls, type_decls
+            )
+
+        # Type objects carry their own type-scope quantity rows so a reviewer
+        # can inspect the unmasked declarations directly.
+        for type_key, row in ctx.root_rows.items():
+            if not row.get("is_type"):
+                continue
+            type_project_id = ctx.project_of_object.get(type_key)
+            for group in _group_quantities_by_identity(
+                type_quantity_declarations(type_key)
+            ).values():
+                ctx.stage_resolved_quantity(
+                    self._make_quantity_row(
+                        object_key=type_key,
+                        group=group,
+                        scope="type",
+                        project_id=type_project_id,
+                        conflict=_quantity_group_conflicts(group, type_project_id),
+                        shadowed=None,
+                    )
+                )
+
+    def _resolve_quantities_for_object(
+        self,
+        object_key: str,
+        instance_decls: list[dict[str, Any]],
+        type_decls: list[dict[str, Any]],
+    ) -> None:
+        ctx = self.ctx
+        assert ctx is not None
+        instance_groups = _group_quantities_by_identity(instance_decls)
+        type_groups = _group_quantities_by_identity(type_decls)
+        project_id = ctx.project_of_object.get(object_key)
+        for identity in sorted(set(instance_groups) | set(type_groups)):
+            inst = instance_groups.get(identity, [])
+            typ = type_groups.get(identity, [])
+            if inst:
+                # Any instance declaration of this identity overrides the
+                # type level, including an instance conflict or an explicit
+                # zero; the type declarations are retained as masked evidence.
+                ctx.stage_resolved_quantity(
+                    self._make_quantity_row(
+                        object_key=object_key,
+                        group=inst,
+                        scope="instance",
+                        project_id=project_id,
+                        conflict=_quantity_group_conflicts(inst, project_id),
+                        shadowed=typ or None,
+                    )
+                )
+            elif typ:
+                ctx.stage_resolved_quantity(
+                    self._make_quantity_row(
+                        object_key=object_key,
+                        group=typ,
+                        scope="type",
+                        project_id=project_id,
+                        conflict=_quantity_group_conflicts(typ, project_id),
+                        shadowed=None,
+                    )
+                )
+
+    def _make_quantity_row(
+        self,
+        *,
+        object_key: str,
+        group: list[dict[str, Any]],
+        scope: str,
+        project_id: int | None,
+        conflict: bool,
+        shadowed: list[dict[str, Any]] | None,
+    ) -> tuple[Any, ...]:
+        ctx = self.ctx
+        assert ctx is not None
+        from .quantities import (
+            QSTATE_UNSUPPORTED,
+            QSTATUS_CONFLICT,
+            interpret_quantity,
+            quantity_identity,
+        )
+
+        canonical = group[0]
+        raw = canonical["raw"]
+        interpreter = self._interpreter_for(project_id)
+        project_units = ctx.project_units.get(project_id or -1, {})
+        interpretations = [
+            interpret_quantity(
+                entry["raw"], interpreter, ctx.resolver, project_units
+            )
+            for entry in group
+        ]
+        # Refine the raw-signature conflict decision with the project's unit
+        # interpretation: declarations whose raw spelling differs but whose
+        # interpreted outcome is identical merge; any interpreted difference is
+        # a conflict and no declaration is picked.
+        if not conflict and len(group) > 1:
+            conflict = len({
+                quantity_outcome_key([entry], [item])
+                for entry, item in zip(group, interpretations)
+            }) > 1
+        identity = quantity_identity(canonical["qset_name"], raw.name, raw.q_kind)
+        sources = [
+            {
+                "source_id": self.source_id,
+                "sha256": ctx.sha,
+                "step_id": entry["raw"].q_step_id,
+                "qset_key": entry["qset_key"],
+                "qset_name": entry["qset_name"],
+                "q_kind": entry["raw"].q_kind,
+                "ordinal": entry["ordinal"],
+                "signature_key": _signature_json_key(entry["signature"]),
+            }
+            for entry in group
+        ]
+        first = interpretations[0]
+        payload: dict[str, Any] = {
+            "identity": identity,
+            "qset_name": canonical["qset_name"],
+            "q_name": raw.name,
+            "q_kind": raw.q_kind,
+            "scope_used": scope,
+            "project_step_id": project_id,
+            "merged_source_count": len(sources),
+            "sources": sources,
+            "declarations": [entry["raw"].as_json() for entry in group],
+            "interpretations": [item.as_json() for item in interpretations],
+        }
+        if shadowed is not None:
+            payload["type_declaration_ignored"] = {
+                "scope": "type",
+                "reason": "instance quantity declarations override the type declaration",
+                "merged_source_count": len(shadowed),
+                "sources": [
+                    {
+                        "source_id": self.source_id,
+                        "sha256": ctx.sha,
+                        "step_id": entry["raw"].q_step_id,
+                        "qset_key": entry["qset_key"],
+                        "qset_name": entry["qset_name"],
+                    }
+                    for entry in shadowed
+                ],
+                "evidence_note": (
+                    "the instance declaration overrides this type declaration "
+                    "even when its value is explicitly zero or null"
+                ),
+            }
+
+        if conflict:
+            state = "conflict"
+            value_status = QSTATUS_CONFLICT
+            reason = "multiple conflicting quantity declarations at the same level"
+            payload["conflicting_declarations"] = [
+                {
+                    "q_step_id": entry["raw"].q_step_id,
+                    "interpretation": item.as_json(),
+                }
+                for entry, item in zip(group, interpretations)
+            ]
+            payload["reason"] = reason
+            canonical_num = canonical_den = None
+            canonical_decimal = None
+            decimal_exact = 0
+            original_raw = None
+            unit_source = None
+            dimension = raw.dimension
+            canonical_unit = first.canonical_unit
+        else:
+            item = first
+            state = (
+                "unsupported"
+                if item.status == "unsupported_type"
+                or raw.structural_state == QSTATE_UNSUPPORTED
+                else (
+                    "explicit_null"
+                    if item.status == "explicit_null"
+                    else "value"
+                )
+            )
+            value_status = item.status
+            reason = item.reason
+            dimension = item.dimension
+            canonical_unit = item.canonical_unit
+            if item.canonical_value is not None:
+                canonical_num = str(item.canonical_value.numerator)
+                canonical_den = str(item.canonical_value.denominator)
+            else:
+                canonical_num = canonical_den = None
+            canonical_decimal = item.canonical_decimal
+            decimal_exact = int(item.canonical_decimal_exact)
+            original_raw = item.original_raw
+            unit_source = item.unit_source
+        return (
+            object_key,
+            self.source_id,
+            canonical["qset_name"],
+            raw.name,
+            raw.q_kind,
+            identity,
+            state,
+            value_status,
+            scope,
+            dimension,
+            canonical_unit,
+            canonical_num,
+            canonical_den,
+            canonical_decimal,
+            decimal_exact,
+            original_raw,
+            unit_source,
+            int(conflict),
+            reason,
+            dump_json(payload),
         )
 
     # -- property sets ------------------------------------------------------
@@ -1918,6 +2471,16 @@ class SourceIngestor:
                 "is_conflict, reason, json FROM resolved_properties_stage"
             )
             conn.execute(
+                "INSERT INTO resolved_quantities(object_key, source_id, qset_name, "
+                "q_name, q_kind, identity, state, value_status, scope_used, dimension, "
+                "canonical_unit, canonical_num, canonical_den, canonical_decimal, "
+                "canonical_decimal_exact, original_raw, unit_source, is_conflict, reason, "
+                "json) SELECT object_key, source_id, qset_name, q_name, q_kind, identity, "
+                "state, value_status, scope_used, dimension, canonical_unit, canonical_num, "
+                "canonical_den, canonical_decimal, canonical_decimal_exact, original_raw, "
+                "unit_source, is_conflict, reason, json FROM resolved_quantities_stage"
+            )
+            conn.execute(
                 "INSERT INTO sources(source_id, declared_sha256, sha256, file_name, "
                 "stored_path, schema_name, status, error, entity_count, root_count, "
                 "object_count, ingested_at, stats_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -1945,6 +2508,7 @@ class SourceIngestor:
             raise
         finally:
             conn.execute("DROP TABLE IF EXISTS resolved_properties_stage")
+            conn.execute("DROP TABLE IF EXISTS resolved_quantities_stage")
 
     def _insert_failure(self, conn: Any, failure: dict[str, Any], sha: str | None) -> None:
         conn.execute(
@@ -2152,6 +2716,85 @@ class SourceIngestor:
                 for link in ctx.object_pset_links
             ],
         )
+        # -- quantity sets, declarations, links ---------------------------
+        from .quantities import quantity_identity
+
+        conn.executemany(
+            "INSERT INTO quantity_set_definitions(qset_key, source_id, sha256, step_id, "
+            "name, entity_type, owner_scope, method_of_measurement, json) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            [
+                (
+                    q["qset_key"],
+                    q["source_id"],
+                    q["sha256"],
+                    q["step_id"],
+                    q["name"],
+                    q["entity_type"],
+                    q["owner_scope"],
+                    q["method_of_measurement"],
+                    dump_json(
+                        {
+                            "description": q["description"],
+                            "owner_keys": q["owner_keys"],
+                        }
+                    ),
+                )
+                for q in ctx.qsets
+            ],
+        )
+        qdecl_rows = []
+        for entry in ctx.quantity_declarations:
+            raw = entry["raw"]
+            qdecl_rows.append(
+                (
+                    f"qdecl:{ctx.sha}:{entry['qset_key']}:{raw.q_step_id}:"
+                    f"{quantity_identity(entry['qset_name'], raw.name, raw.q_kind)}",
+                    self.source_id,
+                    ctx.sha,
+                    entry["qset_key"],
+                    entry["qset_name"],
+                    raw.q_step_id,
+                    raw.q_kind,
+                    raw.name,
+                    quantity_identity(entry["qset_name"], raw.name, raw.q_kind),
+                    _signature_json_key(entry["signature"]),
+                    raw.structural_state,
+                    raw.dimension,
+                    raw.measure_type,
+                    raw.unit_step_id,
+                    "explicit" if raw.unit_step_id is not None else None,
+                    raw.original_raw,
+                    raw.formula,
+                    dump_json(raw.as_json()),
+                )
+            )
+        conn.executemany(
+            "INSERT INTO quantity_declarations(qdecl_key, source_id, sha256, qset_key, "
+            "qset_name, q_step_id, q_kind, q_name, identity, signature, state, dimension, "
+            "measure_type, unit_step_id, unit_source, original_raw, formula, json) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            qdecl_rows,
+        )
+        conn.executemany(
+            "INSERT INTO object_quantity_sets(object_key, source_id, qset_key, "
+            "qset_step_id, scope, relation_key, state, reason) VALUES(?,?,?,?,?,?,?,?)",
+            [
+                (
+                    link["object_key"],
+                    self.source_id,
+                    link["qset_key"],
+                    link["qset_step_id"],
+                    link["scope"],
+                    link["relation_key"],
+                    link["state"],
+                    link["reason"],
+                )
+                for link in ctx.object_qset_links
+            ],
+        )
+        # resolved_quantities rows were streamed into the staging table and
+        # are copied over by _write() after this method returns.
         # resolved_properties rows were streamed into the staging table and are
         # copied over by _write() after this method returns.
         conn.executemany(
@@ -2278,6 +2921,9 @@ class SourceIngestor:
             "types": ctx.counts["types"],
             "properties": ctx.counts["properties"],
             "declarations": len(ctx.declarations),
+            "quantity_sets": len(ctx.qsets),
+            "quantity_declarations": len(ctx.quantity_declarations),
+            "resolved_quantities": ctx.quantity_stream_count,
             "relations": len(ctx.relations),
             "material_nodes": len(ctx.material_nodes),
             "material_assignments": len(ctx.material_assignments),
@@ -2350,6 +2996,90 @@ def _group_by_identity(
         entry["identity"] = identity
         groups[identity].append(entry)
     return groups
+
+
+def _group_quantities_by_identity(
+    declarations: list[dict[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    from .quantities import quantity_identity
+
+    groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for entry in declarations:
+        raw = entry["raw"]
+        identity = quantity_identity(entry["qset_name"], raw.name, raw.q_kind)
+        entry["identity"] = identity
+        groups[identity].append(entry)
+    return groups
+
+
+def _quantity_group_conflicts(
+    group: list[dict[str, Any]], project_id: int | None
+) -> bool:
+    """Whether same-level declarations of one quantity identity disagree.
+
+    Declarations merge only when their interpreted outcome is identical for
+    the object's project: structural state, status, exact canonical value,
+    canonical unit, unit source and reason.  Two raw spellings that normalise
+    to the same canonical value through different valid units therefore merge
+    (keeping every source coordinate), while a unit failure never equals a
+    measured value and an unsupported subtype never equals a quantity.
+    """
+
+    if len(group) < 2:
+        return False
+    # Import lazily; the helper sits at module level and must not create an
+    # import cycle at package import time.
+    from .quantities import interpret_quantity
+
+    # The ingestor's per-project interpreter is reconstructed from the same
+    # durable inputs the ingestion used (resolver + project unit map).  The
+    # caller passes project_id only to select the map; a SourceContext is not
+    # available here by design, so callers supply the interpreter through the
+    # entry's precomputed signature context when present.
+    signatures = {entry["signature"] for entry in group}
+    if len(signatures) > 1:
+        return True
+    raw_states = {
+        (
+            entry["raw"].structural_state,
+            entry["raw"].reason,
+            None
+            if entry["raw"].numeric is None
+            else (
+                str(entry["raw"].numeric.numerator),
+                str(entry["raw"].numeric.denominator),
+            ),
+            entry["raw"].unit_step_id,
+        )
+        for entry in group
+    }
+    return len(raw_states) > 1
+
+
+def quantity_outcome_key(
+    group: list[dict[str, Any]], interpretations: list[Any]
+) -> tuple[Any, ...]:
+    """Hashable interpreted-equality key for one same-level declaration set."""
+
+    parts: list[tuple[Any, ...]] = []
+    for entry, item in zip(group, interpretations):
+        parts.append(
+            (
+                entry["raw"].structural_state,
+                item.status,
+                item.dimension,
+                None
+                if item.canonical_value is None
+                else (
+                    str(item.canonical_value.numerator),
+                    str(item.canonical_value.denominator),
+                ),
+                item.canonical_unit,
+                item.unit_source,
+                item.reason,
+            )
+        )
+    return tuple(sorted(parts))
 
 
 def _has_conflict(group: list[dict[str, Any]]) -> bool:
