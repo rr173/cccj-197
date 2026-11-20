@@ -14,4 +14,4 @@ dependencies = ["ifcopenshell>=0.8"]
 ifc-handover = "ifc_handover.cli:main"
 
 [tool.setuptools]
-packages = ["ifc_handover"]
+packages = ["ifc_handover", "ifc_handover.diff", "ifc_handover.release"]

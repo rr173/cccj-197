@@ -27,6 +27,12 @@ from .ingest import (
     load_manifest,
     sha256_file,
 )
+from .release import (
+    LedgerError,
+    ReleaseDataset,
+    ReleaseVerificationError,
+    build_release_verification,
+)
 from .store import Repository
 
 __all__ = [
@@ -42,11 +48,15 @@ __all__ = [
     "IdentityMappingError",
     "IngestionError",
     "InputModifiedError",
+    "LedgerError",
+    "ReleaseDataset",
+    "ReleaseVerificationError",
     "Repository",
     "SourceIngestor",
     "SourceManifestEntry",
     "build_closure",
     "build_diff",
+    "build_release_verification",
     "export_subset",
     "load_identity_mapping",
     "load_manifest",

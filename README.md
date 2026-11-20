@@ -141,7 +141,7 @@ generated files are not committed.
 ## Tests
 
 ```bash
-python3 run_tests.py            # 169 tests
+python3 run_tests.py            # 207 tests
 python3 run_tests.py test_drill -v
 ```
 
@@ -232,6 +232,67 @@ needed to trace each side — the two full repositories are never copied.
 The two-period IFC fixtures and the hand-written expected change table are
 generated at test time in `tests/diff_fixtures.py`; no large generated files
 are committed.
+
+## Offline release verification
+
+Given one already-ingested repository (the fixed delivery scope), an
+acceptance rules file, a signoff revision ledger (JSONL) and a set of
+verification checkpoints, the `release` entry point answers whether each zone
+may be released at each checkpoint — and lets an auditor reconstruct exactly
+what the duty officer knew at the time, because every checkpoint pairs a
+business moment `effective_at` with a visibility cutoff `known_at`.
+
+```bash
+python3 -m ifc_handover release-verify \
+    --repository out/handover.sqlite \
+    --rules rules.json --ledger ledger.jsonl --checkpoints checkpoints.json \
+    --dest out/release-dataset
+
+python3 -m ifc_handover release-report  --dataset out/release-dataset
+python3 -m ifc_handover release-query   --dataset out/release-dataset matters \
+    --checkpoint cp-new-cutoff --zone zone-a
+python3 -m ifc_handover release-query   --dataset out/release-dataset signoffs \
+    --classification excluded --checkpoint cp-new-cutoff
+python3 -m ifc_handover release-export-jsonl --dataset out/release-dataset \
+    --jsonl out/release.jsonl
+```
+
+* **Determined matters** come from the real repository: devices are enumerated
+  per zone along decomposition/containment edges from the zone's spatial root
+  and matched by exact IFC entity type.  Broken edges, cycles, ambiguous roots
+  and GlobalId-less devices mark a zone `scope_unverified` with the concrete
+  object/edge evidence kept; damage outside a zone never vetoes it.  Devices
+  without any signoff record are still listed.
+* **Signoffs are rebuilt temporally**: the newest ledger revision recorded at
+  or before `known_at` is selected per signoff, then judged for validity at
+  `effective_at` (`[valid_from, valid_to)`, whole-second UTC `Z` timestamps).
+  A withdrawal, rejection or narrowed validity never resurrects an older
+  revision; a late-recorded revision still covers an earlier business moment
+  retroactively.  Conflicting revisions, replays and revision/recording-order
+  inversions are ledger integrity errors that reject the whole run and locate
+  the line.
+* **Coverage** honours device-specific signoffs and, when the rule allows,
+  space signoffs whose target and path stay inside the zone — a storey
+  signoff covers that storey zone's devices but never crosses another zone's
+  root, and the same GlobalId in another source never borrows a signoff.
+  Counted signoffs must stream-verify their ledger-relative document SHA-256.
+  Matters end up `ready` / `undetermined` / `blocked`; a zone is `released`
+  only when its scope is confirmed and every matter is ready.
+* The **release dataset** (`release.sqlite` + `release.jsonl` + README)
+  reopens read-only after being copied elsewhere.  It binds the exact input
+  fingerprints, the parsed rules, the ledger revisions with their source
+  lines, per-checkpoint signoff classifications with rejection reasons, file
+  hash checks, the repository source summary and the STEP evidence located to
+  devices and spatial edges — without copying the repository or attachments.
+  Writes are atomic: a failed run (structural error, or an input that changes
+  mid-run) preserves the previous successful report.  The ledger is indexed
+  on disk and swept once for all checkpoints, so memory stays flat as
+  devices, revisions and checkpoints grow.
+
+The full format, the classification priority order and reproducible commands
+are documented in [`docs/release-verification.md`](docs/release-verification.md);
+the hand-written drill expectations are in
+[`docs/release-drill-expectations.md`](docs/release-drill-expectations.md).
 
 ## Design notes and limits
 

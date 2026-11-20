@@ -19,6 +19,7 @@ from typing import Any
 from .diff import ChangeDataset, build_diff
 from .export import HandoverPackage, export_subset
 from .ingest import SourceIngestor, load_manifest
+from .release import ReleaseDataset, build_release_verification
 from .store import Repository
 
 
@@ -234,6 +235,98 @@ def cmd_diff_export(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_release_verify(args: argparse.Namespace) -> int:
+    """Run one offline release verification into an independent dataset."""
+
+    manifest = build_release_verification(
+        args.repository,
+        args.rules,
+        args.ledger,
+        args.checkpoints,
+        args.dest,
+        label=args.label,
+    )
+    _print_json(
+        {
+            "dataset": os.path.abspath(args.dest),
+            "run": manifest.get("run"),
+            "repository_fingerprint": manifest["repository"]["fingerprint"],
+            "ledger_sha256": manifest["ledger"]["sha256"],
+        }
+    )
+    return 0
+
+
+def cmd_release_report(args: argparse.Namespace) -> int:
+    with ReleaseDataset(args.dataset) as dataset:
+        payload = {
+            "manifest": dataset.manifest(),
+            "summary": dataset.summary(),
+            "zones": dataset.zones(),
+            "checkpoints": dataset.checkpoints(),
+            "zone_decisions": dataset.zone_decisions(),
+            "sources": dataset.sources(),
+        }
+    _print_json(payload)
+    return 0
+
+
+def cmd_release_query(args: argparse.Namespace) -> int:
+    with ReleaseDataset(args.dataset) as dataset:
+        if args.what == "decisions":
+            _print_json(dataset.zone_decisions(checkpoint=args.checkpoint, zone=args.zone))
+        elif args.what == "matters":
+            _print_json(
+                dataset.matters(
+                    checkpoint=args.checkpoint,
+                    zone=args.zone,
+                    device_global_id=args.device_global_id,
+                    status=args.status,
+                    matter_code=args.matter_code,
+                )
+            )
+        elif args.what == "signoffs":
+            _print_json(
+                dataset.signoffs(
+                    record_id=args.record_id,
+                    checkpoint=args.checkpoint,
+                    signoff_id=args.signoff_id,
+                    classification=args.classification,
+                    zone=args.zone,
+                )
+            )
+        elif args.what == "anomalies":
+            _print_json(dataset.anomalies(checkpoint=args.checkpoint))
+        elif args.what == "scope":
+            _print_json(dataset.scope_issues(zone=args.zone))
+        elif args.what == "files":
+            _print_json(dataset.file_checks())
+        elif args.what == "evidence":
+            _print_json(
+                dataset.evidence(owner_kind=args.owner_kind, owner_id=args.owner_id)
+            )
+        elif args.what == "revisions":
+            _print_json(dataset.revisions(signoff_id=args.signoff_id))
+        else:  # pragma: no cover - argparse constrains this
+            raise SystemExit(f"unknown release query {args.what}")
+    return 0
+
+
+def cmd_release_export(args: argparse.Namespace) -> int:
+    with ReleaseDataset(args.dataset) as dataset:
+        rows = 0
+        with open(args.jsonl, "w", encoding="utf-8", newline="\n") as fh:
+            for line in dataset.iter_jsonl():
+                if args.checkpoint and line.get("checkpoint_id") != args.checkpoint:
+                    continue
+                if args.zone and line.get("zone_id") != args.zone:
+                    continue
+                fh.write(json.dumps(line, sort_keys=True, ensure_ascii=False) + "\n")
+                rows += 1
+    _print_json({"jsonl": os.path.abspath(args.jsonl), "rows": rows})
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ifc_handover",
@@ -339,6 +432,62 @@ def build_parser() -> argparse.ArgumentParser:
     diff_export.add_argument("--global-id", dest="global_id", default=None)
     diff_export.add_argument("--subject", default=None)
     diff_export.set_defaults(func=cmd_diff_export)
+
+    release = sub.add_parser(
+        "release-verify",
+        help="verify zone release conditions into an independent release dataset",
+    )
+    release.add_argument("--repository", required=True, help="ingested object repository SQLite")
+    release.add_argument("--rules", required=True, help="acceptance rules JSON")
+    release.add_argument("--ledger", required=True, help="signoff revision ledger JSONL")
+    release.add_argument("--checkpoints", required=True, help="verification checkpoints JSON")
+    release.add_argument("--dest", required=True, help="output release dataset directory")
+    release.add_argument("--label", default=None)
+    release.set_defaults(func=cmd_release_verify)
+
+    release_report = sub.add_parser(
+        "release-report", help="summarise a release dataset and its provenance"
+    )
+    release_report.add_argument("--dataset", required=True)
+    release_report.set_defaults(func=cmd_release_report)
+
+    release_query = sub.add_parser(
+        "release-query", help="query matters, signoffs and evidence from a release dataset"
+    )
+    release_query.add_argument("--dataset", required=True)
+    release_query.add_argument(
+        "what",
+        choices=[
+            "decisions",
+            "matters",
+            "signoffs",
+            "anomalies",
+            "scope",
+            "files",
+            "evidence",
+            "revisions",
+        ],
+    )
+    release_query.add_argument("--checkpoint", default=None)
+    release_query.add_argument("--zone", default=None)
+    release_query.add_argument("--device-global-id", dest="device_global_id", default=None)
+    release_query.add_argument("--status", default=None)
+    release_query.add_argument("--matter-code", dest="matter_code", default=None)
+    release_query.add_argument("--record-id", dest="record_id", default=None)
+    release_query.add_argument("--signoff-id", dest="signoff_id", default=None)
+    release_query.add_argument("--classification", default=None)
+    release_query.add_argument("--owner-kind", dest="owner_kind", default=None)
+    release_query.add_argument("--owner-id", dest="owner_id", default=None)
+    release_query.set_defaults(func=cmd_release_query)
+
+    release_export = sub.add_parser(
+        "release-export-jsonl", help="export filtered release records as JSONL"
+    )
+    release_export.add_argument("--dataset", required=True)
+    release_export.add_argument("--jsonl", required=True)
+    release_export.add_argument("--checkpoint", default=None)
+    release_export.add_argument("--zone", default=None)
+    release_export.set_defaults(func=cmd_release_export)
     return parser
 
 
